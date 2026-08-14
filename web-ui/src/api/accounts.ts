@@ -36,3 +36,41 @@ export async function updateAccount(name: string, content: string): Promise<Acco
 export async function deleteAccount(name: string): Promise<{ message: string }> {
   return await http(`/api/accounts/${encodeURIComponent(name)}`, { method: 'DELETE' })
 }
+
+export async function authorizeAccount(name: string, timeout = 300): Promise<{ message: string; path: string; cookies: number }> {
+  return await http(`/api/accounts/${encodeURIComponent(name)}/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ timeout }),
+  })
+}
+
+export interface QrSession {
+  success: boolean
+  session_id: string
+  qr_code_url: string
+  expires_in: number
+  message?: string
+}
+
+export interface QrSessionStatus {
+  status: string
+  session_id: string
+  account_name?: string
+  message?: string
+  verification_url?: string
+  path?: string
+  cookies?: number
+}
+
+export async function createQrSession(name: string): Promise<QrSession> {
+  return await http('/api/accounts/qr/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export async function getQrSessionStatus(sessionId: string): Promise<QrSessionStatus> {
+  return await http(`/api/accounts/qr/${encodeURIComponent(sessionId)}/status`)
+}

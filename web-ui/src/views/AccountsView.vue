@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { listAccounts, getAccount, createAccount, updateAccount, deleteAccount, type AccountItem } from '@/api/accounts'
+import { listAccounts, getAccount, createAccount, updateAccount, deleteAccount, createQrSession, getQrSessionStatus, type AccountItem } from '@/api/accounts'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -21,12 +21,99 @@ const router = useRouter()
 const isCreateDialogOpen = ref(false)
 const isEditDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
+const isQrDialogOpen = ref(false)
 
 const newName = ref('')
 const newContent = ref('')
 const editName = ref('')
 const editContent = ref('')
 const deleteName = ref('')
+
+const qrName = ref('')
+const qrImage = ref('')
+const qrStatus = ref('') // generating / waiting / scanned / success / expired / cancelled / verification_required
+const qrError = ref('')
+const qrSessionId = ref('')
+const isQrPolling = ref(false)
+let qrPollTimer: ReturnType<typeof setInterval> | null = null
+
+function stopQrPolling() {
+  if (qrPollTimer) {
+    clearInterval(qrPollTimer)
+    qrPollTimer = null
+  }
+  isQrPolling.value = false
+}
+
+function openQrDialog(name?: string) {
+  qrName.value = name || ''
+  qrImage.value = ''
+  qrStatus.value = ''
+  qrError.value = ''
+  qrSessionId.value = ''
+  stopQrPolling()
+  isQrDialogOpen.value = true
+}
+
+async function startQrLogin() {
+  if (!qrName.value.trim()) {
+    toast({ title: t('accounts.toasts.incomplete'), description: t('accounts.toasts.nameRequired'), variant: 'destructive' })
+    return
+  }
+  qrError.value = ''
+  qrImage.value = ''
+  qrStatus.value = 'generating'
+  try {
+    const res = await createQrSession(qrName.value.trim())
+    if (!res.success) {
+      qrStatus.value = ''
+      qrError.value = res.message || t('accounts.qr.createFailed')
+      return
+    }
+    qrSessionId.value = res.session_id
+    qrImage.value = res.qr_code_url
+    qrStatus.value = 'waiting'
+    isQrPolling.value = true
+    qrPollTimer = setInterval(pollQrStatus, 1000)
+  } catch (e) {
+    qrStatus.value = ''
+    qrError.value = (e as Error).message
+  }
+}
+
+async function pollQrStatus() {
+  if (!qrSessionId.value) return
+  let st
+  try {
+    st = await getQrSessionStatus(qrSessionId.value)
+  } catch (e) {
+    return // 轮询请求失败则稍后重试，不打断扫码
+  }
+  const status = st.status
+  if (status === 'success') {
+    stopQrPolling()
+    qrStatus.value = 'success'
+    toast({ title: t('accounts.toasts.authorized'), description: st.message })
+    setTimeout(() => {
+      isQrDialogOpen.value = false
+      fetchAccounts()
+    }, 1200)
+  } else if (status === 'expired' || status === 'cancelled') {
+    stopQrPolling()
+    qrStatus.value = status
+    qrError.value = st.message || (status === 'expired' ? t('accounts.qr.expired') : t('accounts.qr.cancelled'))
+  } else if (status === 'verification_required') {
+    stopQrPolling()
+    qrStatus.value = status
+    qrError.value = st.message || t('accounts.qr.verificationRequired')
+  } else if (status === 'scanned' || status === 'waiting') {
+    qrStatus.value = status
+  } else if (status === 'not_found') {
+    stopQrPolling()
+    qrStatus.value = ''
+    qrError.value = t('accounts.qr.sessionLost')
+  }
+}
 
 async function fetchAccounts() {
   isLoading.value = true
@@ -128,7 +215,10 @@ onMounted(fetchAccounts)
         <h1 class="text-2xl font-bold text-gray-800">{{ t('accounts.title') }}</h1>
         <p class="text-sm text-gray-500 mt-1">{{ t('accounts.description') }}</p>
       </div>
-      <Button class="w-full sm:w-auto" @click="openCreateDialog">{{ t('accounts.add') }}</Button>
+      <div class="flex gap-2">
+        <Button variant="outline" class="w-full sm:w-auto" @click="openCreateDialog">{{ t('accounts.addManual') }}</Button>
+        <Button class="w-full sm:w-auto" @click="openQrDialog()">{{ t('accounts.add') }}</Button>
+      </div>
     </div>
 
     <Card class="app-surface mb-6 border-none">
@@ -137,28 +227,11 @@ onMounted(fetchAccounts)
       </CardHeader>
       <CardContent class="text-sm text-gray-600">
         <ol class="list-decimal list-inside space-y-1">
-          <li>
-            {{ t('accounts.cookieGuide.step1Prefix') }}
-            <a
-              class="text-blue-600 hover:underline"
-              href="https://chromewebstore.google.com/detail/xianyu-login-state-extrac/eidlpfjiodpigmfcahkmlenhppfklcoa"
-              target="_blank"
-              rel="noopener noreferrer"
-            >{{ t('accounts.cookieGuide.extension') }}</a>
-          </li>
-          <li>
-            {{ t('accounts.cookieGuide.step2Prefix') }}
-            <a
-              class="text-blue-600 hover:underline"
-              href="https://www.goofish.com"
-              target="_blank"
-              rel="noopener noreferrer"
-            >{{ t('accounts.cookieGuide.website') }}</a>
-          </li>
+          <li>{{ t('accounts.cookieGuide.step1') }}</li>
+          <li>{{ t('accounts.cookieGuide.step2') }}</li>
           <li>{{ t('accounts.cookieGuide.step3') }}</li>
-          <li>{{ t('accounts.cookieGuide.step4') }}</li>
-          <li>{{ t('accounts.cookieGuide.step5') }}</li>
         </ol>
+        <p class="mt-4 text-xs text-gray-400">{{ t('accounts.cookieGuide.fallbackHint') }}</p>
       </CardContent>
     </Card>
 
@@ -185,6 +258,7 @@ onMounted(fetchAccounts)
               <p class="break-all text-sm text-slate-500">{{ account.path }}</p>
             </div>
             <div class="mt-4 flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" class="flex-1 min-w-[120px]" @click="openQrDialog(account.name)">{{ t('accounts.list.reauthorize') }}</Button>
               <Button size="sm" variant="outline" class="flex-1 min-w-[120px]" @click="openEditDialog(account.name)">{{ t('accounts.list.update') }}</Button>
               <Button size="sm" variant="destructive" class="flex-1 min-w-[120px]" @click="openDeleteDialog(account.name)">{{ t('accounts.list.delete') }}</Button>
             </div>
@@ -213,6 +287,7 @@ onMounted(fetchAccounts)
                 <TableCell class="text-right">
                   <div class="flex justify-end gap-2">
                     <Button size="sm" variant="outline" @click="goCreateTask(account.name)">{{ t('accounts.list.createTask') }}</Button>
+                    <Button size="sm" variant="outline" @click="openQrDialog(account.name)">{{ t('accounts.list.reauthorize') }}</Button>
                     <Button size="sm" variant="outline" @click="openEditDialog(account.name)">{{ t('accounts.list.update') }}</Button>
                     <Button size="sm" variant="destructive" @click="openDeleteDialog(account.name)">{{ t('accounts.list.delete') }}</Button>
                   </div>
@@ -281,6 +356,49 @@ onMounted(fetchAccounts)
           <Button variant="destructive" :disabled="isSaving" @click="handleDeleteAccount">
             {{ isSaving ? t('accounts.deleteDialog.deleting') : t('accounts.list.delete') }}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="isQrDialogOpen">
+      <DialogContent class="sm:max-w-[420px]">
+        <DialogHeader>
+          <DialogTitle>{{ t('accounts.qr.title') }}</DialogTitle>
+          <DialogDescription>{{ t('accounts.qr.description') }}</DialogDescription>
+        </DialogHeader>
+        <div class="flex flex-col items-center gap-4">
+          <div class="grid w-full gap-2">
+            <Label>{{ t('accounts.qr.name') }}</Label>
+            <Input v-model="qrName" :placeholder="t('accounts.qr.namePlaceholder')" :disabled="isQrPolling || qrStatus === 'generating'" />
+          </div>
+
+          <template v-if="qrStatus === 'generating'">
+            <div class="py-8 text-sm text-muted-foreground">{{ t('accounts.qr.generating') }}</div>
+          </template>
+
+          <template v-else-if="qrImage">
+            <div class="rounded-lg border p-3">
+              <img :src="qrImage" class="h-56 w-56 object-contain" alt="QR" />
+            </div>
+            <div class="text-sm">
+              <span v-if="qrStatus === 'waiting'" class="text-gray-600">{{ t('accounts.qr.waiting') }}</span>
+              <span v-else-if="qrStatus === 'scanned'" class="text-blue-600">{{ t('accounts.qr.scanned') }}</span>
+              <span v-else-if="qrStatus === 'success'" class="text-green-600">{{ t('accounts.qr.success') }}</span>
+            </div>
+          </template>
+
+          <div v-if="qrError" class="text-sm text-red-600">{{ qrError }}</div>
+          <div class="text-xs text-gray-400">{{ t('accounts.qr.hint') }}</div>
+        </div>
+        <DialogFooter>
+          <div class="flex w-full items-center justify-between gap-2">
+            <Button v-if="isQrPolling" variant="outline" @click="stopQrPolling(); qrStatus = ''">{{ t('accounts.qr.regenerate') }}</Button>
+            <span v-else></span>
+            <Button variant="outline" @click="isQrDialogOpen = false" :disabled="isQrPolling">{{ t('common.cancel') }}</Button>
+            <Button v-if="!isQrPolling" :disabled="qrStatus === 'generating'" @click="startQrLogin">
+              {{ qrStatus === 'generating' ? t('accounts.qr.generating') : t('accounts.qr.start') }}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
