@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import socket
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlencode
@@ -73,6 +74,58 @@ class LoginRequiredError(Exception):
 
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
+
+# 爬虫浏览器可能访问的闲鱼域名。
+# 若本机没有可用 IPv6 网络，而 DNS 返回了 IPv6 地址，Chromium 会优先尝试 IPv6，
+# 导致连接挂起（ERR_NAME_NOT_RESOLVED / Timeout 30000ms）。
+_GOOFISH_DOMAINS = (
+    "www.goofish.com",
+    "h5api.m.goofish.com",
+    "passport.goofish.com",
+    "pages.goofish.com",
+)
+
+
+def _build_ipv4_host_rules() -> str:
+    """解析 goofish 域名的 IPv4 地址，构造 --host-resolver-rules 规则强制走 IPv4。"""
+    rules = []
+    for domain in _GOOFISH_DOMAINS:
+        try:
+            infos = socket.getaddrinfo(domain, 443, socket.AF_INET, socket.SOCK_STREAM)
+            ip = infos[0][4][0] if infos else None
+        except Exception:  # noqa: BLE001 - DNS 失败时跳过该域名
+            ip = None
+        if ip:
+            rules.append(f"MAP {domain} {ip}")
+    return ",".join(rules)
+
+
+# 会话 token 类 cookie：扫码登录时通过 HTTP 获取的 _m_h5_tk 与浏览器会话不匹配，
+# mtop 签名校验失败会返回 FAIL_SYS_ILLEGAL_ACCESS（非法请求）。
+# 浏览器加载页面后 mtop.js 会自动获取新的 token，因此加载登录态前必须剔除它们。
+_SESSION_TOKEN_COOKIES = {"_m_h5_tk", "_m_h5_tk_enc", "mtop_partitioned_detect", "XSRF-TOKEN"}
+
+
+def _strip_session_token_cookies(cookies) -> list:
+    if not isinstance(cookies, list):
+        return cookies if isinstance(cookies, list) else []
+    return [c for c in cookies if c.get("name") not in _SESSION_TOKEN_COOKIES]
+
+
+def _sanitize_storage_state(arg) -> dict:
+    """清理 storage_state：剔除会话 token cookie，返回可直接传给 Playwright 的 dict。"""
+    if isinstance(arg, dict):
+        if isinstance(arg.get("cookies"), list):
+            arg = dict(arg)
+            arg["cookies"] = _strip_session_token_cookies(arg["cookies"])
+        return arg
+    try:
+        with open(arg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["cookies"] = _strip_session_token_cookies(data.get("cookies", []))
+        return data
+    except Exception:  # noqa: BLE001 - 读取失败时原样返回，由后续流程处理
+        return arg
 
 
 def _is_login_url(url: str) -> bool:
@@ -563,13 +616,42 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             launch_kwargs = {"headless": RUN_HEADLESS, "args": launch_args}
             if proxy_server:
                 launch_kwargs["proxy"] = {"server": proxy_server}
+            else:
+                # 未配置代理池时绕过系统代理直连：用户若开着代理工具（Clash/V2Ray 等），
+                # 浏览器会跟随系统代理，导致 goofish.com DNS 解析失败或页面加载超时。
+                launch_args.append("--no-proxy-server")
+                # 本机无 IPv6 网络时，强制 goofish 域名走 IPv4，避免 Chromium 优先尝试
+                # IPv6 地址导致连接挂起（ERR_NAME_NOT_RESOLVED / Timeout 30000ms）。
+                host_rules = _build_ipv4_host_rules()
+                if host_rules:
+                    launch_args.append(f"--host-resolver-rules={host_rules}")
 
-            launch_kwargs["channel"] = _resolve_browser_channel()
-
-            browser = await p.chromium.launch(**launch_kwargs)
+            launch_channel = _resolve_browser_channel()
+            # 候选通道：默认 → 系统 Edge（Win10/11 自带）→ 内置 Chromium（随包分发）
+            _channels = [launch_channel]
+            for _extra in ("msedge", "chromium"):
+                if _extra not in _channels:
+                    _channels.append(_extra)
+            browser = None
+            last_error: Optional[Exception] = None
+            for _ch in _channels:
+                _kwargs = dict(launch_kwargs)
+                if _ch == "chromium":
+                    # channel=None 时 playwright 使用内置浏览器（无头用 headless shell，有头用完整版）
+                    _kwargs.pop("channel", None)
+                else:
+                    _kwargs["channel"] = _ch
+                try:
+                    browser = await p.chromium.launch(**_kwargs)
+                    break
+                except Exception as e:  # noqa: BLE001 - 逐个通道尝试，全部失败才抛出
+                    last_error = e
+                    print(f"使用 {_ch} 启动浏览器失败 ({e})，尝试下一个通道...")
+            if browser is None:
+                raise last_error  # type: ignore[misc]
 
             context_kwargs = _default_context_options()
-            storage_state_arg = state_file
+            storage_state_arg = _sanitize_storage_state(state_file)
             analysis_dispatcher: Optional[ItemAnalysisDispatcher] = None
 
             if isinstance(snapshot_data, dict):
@@ -579,13 +661,17 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     for key in ("env", "headers", "page", "storage")
                 ):
                     print(f"检测到增强浏览器快照，应用环境参数: {state_file}")
-                    storage_state_arg = {"cookies": snapshot_data.get("cookies", [])}
+                    storage_state_arg = {
+                        "cookies": _strip_session_token_cookies(
+                            snapshot_data.get("cookies", [])
+                        )
+                    }
                     context_kwargs.update(_build_context_overrides(snapshot_data))
                     extra_headers = _build_extra_headers(snapshot_data.get("headers"))
                     if extra_headers:
                         context_kwargs["extra_http_headers"] = extra_headers
                 else:
-                    storage_state_arg = snapshot_data
+                    storage_state_arg = _sanitize_storage_state(snapshot_data)
 
             context_kwargs = _clean_kwargs(context_kwargs)
             context = await browser.new_context(
