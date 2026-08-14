@@ -294,17 +294,22 @@ async def test_ai_settings(settings: dict):
         submitted_api_key = settings.get("OPENAI_API_KEY", "")
         api_key = submitted_api_key or stored_api_key
 
+        # 前端可能不提交 base_url/model（例如仅修改 Key），此时回退到已保存的配置，
+        # 避免 base_url 为空导致请求打到默认的 api.openai.com。
+        base_url = settings.get("OPENAI_BASE_URL") or env_manager.get_value("OPENAI_BASE_URL", "")
+        model_name = settings.get("OPENAI_MODEL_NAME") or env_manager.get_value("OPENAI_MODEL_NAME", "")
+
         client_params = {
             "api_key": api_key,
-            "base_url": settings.get("OPENAI_BASE_URL", ""),
+            "base_url": base_url,
             "timeout": httpx.Timeout(30.0),
         }
 
-        proxy_url = settings.get("PROXY_URL", "")
+        proxy_url = settings.get("PROXY_URL")
+        if not proxy_url:
+            proxy_url = env_manager.get_value("PROXY_URL", "")
         if proxy_url:
             client_params["http_client"] = httpx.Client(proxy=proxy_url)
-
-        model_name = settings.get("OPENAI_MODEL_NAME", "")
         client = OpenAI(**client_params)
         messages = [{"role": "user", "content": AI_TEST_PROMPT}]
         api_mode = CHAT_COMPLETIONS_API_MODE

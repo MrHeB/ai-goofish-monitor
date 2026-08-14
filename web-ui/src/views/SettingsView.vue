@@ -96,7 +96,11 @@ async function handleSaveRotation() {
 async function handleTestAi() {
   try {
     const res = await testAiConnection()
-    notifySuccess(t('settings.ai.testSuccess'), res.message)
+    if (res.success) {
+      notifySuccess(t('settings.ai.testSuccess'), res.message)
+    } else {
+      notifyError(t('settings.ai.testFailed'), res.message)
+    }
   } catch (e) {
     notifyError(t('settings.ai.testFailed'), (e as Error).message)
   }

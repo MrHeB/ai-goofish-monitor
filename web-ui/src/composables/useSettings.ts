@@ -99,10 +99,8 @@ export function useSettings() {
         delete payload.OPENAI_API_KEY
       }
       await settingsApi.updateAiSettings(payload)
-      if (aiSettings.value.OPENAI_API_KEY) {
-        aiSettings.value.OPENAI_API_KEY = ''
-      }
-      // Refresh status
+      // 不清空输入框：Key 不回显已容易让用户误以为未保存，保留输入值可即时确认。
+      // 刷新 status 让"已配置"提示与输入框占位文本同步更新。
       systemStatus.value = await settingsApi.getSystemStatus()
     } catch (e) {
       if (e instanceof Error) error.value = e
