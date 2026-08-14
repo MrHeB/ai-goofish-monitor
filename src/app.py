@@ -3,9 +3,67 @@
 整合所有路由和服务
 """
 from contextlib import asynccontextmanager
+import os
+import sys
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+
+def _resource_root() -> str:
+    """定位只读前端/静态资源目录。
+
+    - 打包为单文件（onefile）时，资源随包打进 exe，运行期解压到 _MEIPASS；
+    - onedir 时前端在 exe 同级目录（构建后复制）；
+    - 未打包开发时就是当前目录。
+    """
+    if getattr(sys, "frozen", False):
+        _meipass = getattr(sys, "_MEIPASS", "")
+        if _meipass and os.path.exists(os.path.join(_meipass, "dist", "index.html")):
+            return _meipass
+        return os.path.dirname(sys.executable)
+    return os.getcwd()
+
+
+_RESOURCE_ROOT = _resource_root()
+
+# 运行数据目录（打包后位于 exe 旁，由 desktop_launcher 创建；此处兜底，保证任何启动方式都可用）
+_RUNTIME_DIRS = ("jsonl", "logs", "images", "data", "state", "prompts")
+
+
+def _ensure_runtime_dirs() -> None:
+    """确保所有运行数据目录存在，避免因目录缺失导致任务/日志/账号等报错。"""
+    for _d in _RUNTIME_DIRS:
+        try:
+            os.makedirs(_d, exist_ok=True)
+        except OSError:
+            pass
+    _ensure_prompts_reference()
+
+
+def _ensure_prompts_reference() -> None:
+    """确保 prompts 参考文件存在。
+
+    打包为单文件（onefile）时，参考文件随包解压到只读的 _MEIPASS；
+    若 exe 旁还没有参考文件（首次启动/新机器），从 _MEIPASS 复制一份，
+    保证 AI 任务生成能正常读取范例文件。
+    """
+    if os.path.exists(os.path.join("prompts", "macbook_criteria.txt")):
+        return
+    _meipass = getattr(sys, "_MEIPASS", "") if getattr(sys, "frozen", False) else ""
+    if not _meipass:
+        return
+    _src_dir = os.path.join(_meipass, "prompts")
+    if not os.path.isdir(_src_dir):
+        return
+    try:
+        import shutil
+        for _name in os.listdir(_src_dir):
+            _src = os.path.join(_src_dir, _name)
+            if os.path.isfile(_src) and not os.path.exists(os.path.join("prompts", _name)):
+                shutil.copy2(_src, os.path.join("prompts", _name))
+    except OSError:
+        pass
 
 from src.api.routes import (
     dashboard,
@@ -67,6 +125,7 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     print("正在启动应用...")
+    _ensure_runtime_dirs()
     bootstrap_sqlite_storage()
     cleanup_task_logs(keep_days=app_settings.task_log_retention_days)
 
@@ -115,13 +174,15 @@ app.include_router(accounts.router)
 
 # 挂载静态文件
 # 旧的静态文件目录（用于截图等）
-app.mount("/static", StaticFiles(directory="static"), name="static")
+_static_dir = os.path.join(_RESOURCE_ROOT, "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 # 挂载 Vue 3 前端构建产物
 # 注意：需要在所有 API 路由之后挂载，以避免覆盖 API 路由
-import os
-if os.path.exists("dist"):
-    app.mount("/assets", StaticFiles(directory="dist/assets"), name="assets")
+_dist_dir = os.path.join(_RESOURCE_ROOT, "dist")
+if os.path.isdir(os.path.join(_dist_dir, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_dist_dir, "assets")), name="assets")
 
 
 # 健康检查端点
@@ -155,8 +216,9 @@ from fastapi.responses import JSONResponse
 @app.get("/")
 async def read_root(request: Request):
     """提供 Vue 3 SPA 的主页面"""
-    if os.path.exists("dist/index.html"):
-        return FileResponse("dist/index.html")
+    _index = os.path.join(_RESOURCE_ROOT, "dist", "index.html")
+    if os.path.exists(_index):
+        return FileResponse(_index, headers={"Cache-Control": "no-cache"})
     else:
         return JSONResponse(
             status_code=500,
@@ -176,8 +238,9 @@ async def serve_spa(request: Request, full_path: str):
         return JSONResponse(status_code=404, content={"error": "资源未找到"})
 
     # 其他所有路径都返回 index.html，让前端路由处理
-    if os.path.exists("dist/index.html"):
-        return FileResponse("dist/index.html")
+    _index = os.path.join(_RESOURCE_ROOT, "dist", "index.html")
+    if os.path.exists(_index):
+        return FileResponse(_index, headers={"Cache-Control": "no-cache"})
     else:
         return JSONResponse(
             status_code=500,

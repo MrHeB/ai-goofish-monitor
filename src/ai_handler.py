@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import codecs
+import io
 import json
 import os
 import re
@@ -11,11 +13,31 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import requests
 
-# 设置标准输出编码为UTF-8，解决Windows控制台编码问题
+# 设置标准输出编码为UTF-8，解决Windows控制台编码问题。
+# 打包为无控制台窗口（windowed）程序时，stdout/stderr 句柄可能无效，
+# detach() 会抛 OSError，这里做防御性处理，失败时保持原样即可。
+# 注意 stdout/stderr 可能指向同一个对象（如重定向到同一日志文件），
+# 需按对象去重，避免二次 detach 破坏已分离的包装器。
 if sys.platform.startswith('win'):
-    import codecs
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+    _names = ('stdout', 'stderr')
+    _streams = [(n, getattr(sys, n)) for n in _names if getattr(sys, n) is not None]
+    _unique = []
+    _seen_ids = set()
+    for _name, _stream in _streams:
+        if id(_stream) not in _seen_ids:
+            _seen_ids.add(id(_stream))
+            _unique.append((_name, _stream))
+    for _name, _stream in _unique:
+        try:
+            _raw = _stream.detach()
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            continue
+        _writer = codecs.getwriter('utf-8')(_raw)
+        setattr(sys, _name, _writer)
+        # stdout/stderr 原本指向同一对象时，另一个名字也同步指向新包装器
+        for _other, _same in _streams:
+            if _other != _name and _same is _stream:
+                setattr(sys, _other, _writer)
 
 from src.config import (
     AI_DEBUG_MODE,
