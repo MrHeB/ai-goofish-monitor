@@ -87,29 +87,6 @@ def _cookie_changed(
     return current > (previous_mtime + 1e-6)
 
 
-class _FileLock:
-    def __init__(self, fh):
-        self._fh = fh
-
-    def __enter__(self):
-        try:
-            import fcntl
-
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            import fcntl
-
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        return False
-
-
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -135,12 +112,29 @@ def _read_json_file(path: str) -> dict:
 
 def _atomic_write_json(path: str, data: dict) -> None:
     _ensure_parent_dir(path)
-    tmp = f"{path}.tmp"
+    # 临时文件名必须唯一：API 主进程与爬虫子进程可能同时写同一目标文件，
+    # 若共用固定 .tmp 名称，第二个进程打开/替换时会互相冲突。
+    tmp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # Windows 上目标文件可能被其他进程（API 主进程 / 爬虫子进程）短暂占用，
+    # os.replace 需要删除旧文件，冲突时会抛 PermissionError。短时重试几次，
+    # 仍失败则退化为直接覆盖写，保证熔断状态记录失败不会中断任务本身。
+    for _ in range(3):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError:
+            time.sleep(0.05)
+    try:
+        with open(tmp, "r", encoding="utf-8") as f:
+            content = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception:  # noqa: BLE001 - 兜底失败时保留临时文件供下次读取，不抛出
+        pass
 
 
 @dataclass(frozen=True)
@@ -187,19 +181,18 @@ class FailureGuard:
         _atomic_write_json(self.path, data)
 
     def _update_task(self, task_key: str, updater) -> dict:
+        # 注意：Windows 下 fcntl 不可用，跨进程"读-改-写"只保证最终一致性；
+        # 不持有目标文件句柄，配合 _atomic_write_json 的重试/兜底可避免进程间写冲突。
         _ensure_parent_dir(self.path)
-        with open(self.path, "a+", encoding="utf-8") as fh:
-            with _FileLock(fh):
-                fh.seek(0)
-                data = self._load()
-                tasks = data.setdefault("tasks", {})
-                entry = tasks.get(task_key) or {}
-                if not isinstance(entry, dict):
-                    entry = {}
-                entry = updater(entry) or entry
-                tasks[task_key] = entry
-                self._save(data)
-                return entry
+        data = self._load()
+        tasks = data.setdefault("tasks", {})
+        entry = tasks.get(task_key) or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry = updater(entry) or entry
+        tasks[task_key] = entry
+        self._save(data)
+        return entry
 
     def record_success(self, task_key: str, *, now: Optional[datetime] = None) -> None:
         def _reset(_: dict) -> dict:
